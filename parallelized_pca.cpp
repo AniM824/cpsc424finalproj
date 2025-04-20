@@ -255,7 +255,7 @@ parlay::sequence<parlay::sequence<double>> get_proj_matrix(const parlay::sequenc
     return pca_matrix;
 }
 
-void mean_center(Matrix &data) {
+void mean_center(Matrix& data) {
     size_t n = data.size();
     size_t d = data[0].size();
 
@@ -272,7 +272,6 @@ void mean_center(Matrix &data) {
     });
 }
 
-
 int main() {
     std::string filename = "train-images-idx3-ubyte";
     Matrix U = load_mnist_images_parlay(filename);
@@ -280,11 +279,6 @@ int main() {
 
     auto U_t = parlay_transpose(U);
     auto UTU = parlay_matrix_multiply(U_t, U);
-
-    std::cout << "Loaded " << U.size() << " images, each with "
-                << U[0].size() << " pixels." << std::endl;
-
-
 
     int k = 1;
     auto result = randomized_block_power_iteration(UTU, k);
@@ -311,7 +305,7 @@ int main() {
     //     }
     //     i += 1;
     // std::cout << "\n";
-}
+    //}
 
 
     return 0;
