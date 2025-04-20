@@ -255,10 +255,28 @@ parlay::sequence<parlay::sequence<double>> get_proj_matrix(const parlay::sequenc
     return pca_matrix;
 }
 
+void mean_center(Matrix &data) {
+    size_t n = data.size();
+    size_t d = data[0].size();
+
+    Vector mean = parlay::tabulate(d, [&](size_t j) {
+        return parlay::reduce(parlay::tabulate(n, [&](size_t i) {
+            return data[i][j];
+        })) / static_cast<double>(n);
+    });
+
+    parlay::parallel_for(0, n, [&](size_t i) {
+        parlay::parallel_for(0, d, [&](size_t j) {
+            data[i][j] -= mean[j];
+        });
+    });
+}
+
 
 int main() {
     std::string filename = "train-images-idx3-ubyte";
     Matrix U = load_mnist_images_parlay(filename);
+    mean_center(U);
 
     auto U_t = parlay_transpose(U);
     auto UTU = parlay_matrix_multiply(U_t, U);
