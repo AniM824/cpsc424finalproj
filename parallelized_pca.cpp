@@ -234,7 +234,7 @@ std::pair<Matrix, Vector> eigen_decompose_small(const Matrix &B) {
   return {V, eigenvalues};
 }
 
-std::pair<Matrix, Vector> randomized_block_power_iteration(const Matrix& A, int k, int q = 10){
+std::pair<Matrix, Vector> randomized_block_power_iteration(const Matrix& A, int k, int q = 100){
   size_t d = A.size();
 
   Matrix Omega = random_matrix_generator(d, k);

@@ -49,9 +49,13 @@ for i, (fname, title) in enumerate(zip(files, titles), start=1):
     scats.append(sc)
 
 # shared colorbar for both subplots
-cbar = fig.colorbar(scats[0], ax=fig.axes, ticks=range(10), pad=0.1)
+cax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+cbar = fig.colorbar(
+    scats[0],
+    cax=cax,
+    ticks=range(10)
+)
 cbar.set_label('Digit label')
-cbar.set_ticklabels(range(10))
 
-plt.tight_layout()
+plt.tight_layout(rect=[0, 0, 0.90, 1.0])
 plt.show()
