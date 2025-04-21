@@ -10,10 +10,70 @@
 #include <random>
 #include <utility>
 #include <chrono>
+#include <Accelerate/Accelerate.h>
+
 
 
 using Vector = parlay::sequence<double>;
 using Matrix = parlay::sequence<Vector>;
+
+
+
+
+
+
+
+
+// #include <cblas.h>
+#include "parlay/sequence.h"
+
+using Vector = parlay::sequence<double>;
+using Matrix = parlay::sequence<Vector>;
+
+Matrix blas_matrix_multiply(const Matrix& A, const Matrix& B) {
+    size_t m = A.size();        // rows of A
+    size_t k = A[0].size();     // cols of A (and rows of B)
+    size_t n = B[0].size();     // cols of B
+
+    // === Flatten A and B into row-major arrays ===
+    std::vector<double> A_flat(m * k);
+    std::vector<double> B_flat(k * n);
+
+    for (size_t i = 0; i < m; ++i)
+        std::copy(A[i].begin(), A[i].end(), A_flat.begin() + i * k);
+
+    for (size_t i = 0; i < k; ++i)
+        std::copy(B[i].begin(), B[i].end(), B_flat.begin() + i * n);
+
+    // === Allocate space for output ===
+    std::vector<double> C_flat(m * n, 0.0);
+
+    // === Call BLAS ===
+    cblas_dgemm(
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        m, n, k,
+        1.0,
+        A_flat.data(), k,
+        B_flat.data(), n,
+        0.0,
+        C_flat.data(), n
+    );
+
+    // === Convert back to parlay Matrix ===
+    Matrix C = parlay::tabulate(m, [&](size_t i) {
+        return parlay::tabulate(n, [&](size_t j) {
+            return C_flat[i * n + j];
+        });
+    });
+
+    return C;
+}
+
+
+
+
+
+
 
 struct eigenpair {
     double eigenvalue;
@@ -143,7 +203,7 @@ Matrix gram_schmidt(const Matrix &Y_cols) {
                 });
             });
 
-            auto projections_T = parlay_transpose(projections);  // d × i
+            auto projections_T = parlay_transpose(projections);
             Vector total_projection = parlay::tabulate(d, [&](size_t l) {
                 return parlay::reduce(projections_T[l], parlay::addm<double>());
             });
@@ -184,20 +244,18 @@ std::pair<Matrix, Matrix> qr_decomposition_givens(const Matrix &A) {
       double c = a / r;
       double s = -b / r;
 
-      // === Parallel rotation on R (rows i-1 and i) ===
       parlay::parallel_for(0, n, [&](size_t k) {
         double R_ik1 = R[i - 1][k];
         double R_ik2 = R[i][k];
         R[i - 1][k] = c * R_ik1 - s * R_ik2;
-        R[i][k]     = s * R_ik1 + c * R_ik2;
+        R[i][k] = s * R_ik1 + c * R_ik2;
       });
 
-      // === Parallel rotation on Q (accumulate transforms) ===
       parlay::parallel_for(0, n, [&](size_t k) {
         double Q_ik1 = Q[k][i - 1];
         double Q_ik2 = Q[k][i];
         Q[k][i - 1] = c * Q_ik1 - s * Q_ik2;
-        Q[k][i]     = s * Q_ik1 + c * Q_ik2;
+        Q[k][i] = s * Q_ik1 + c * Q_ik2;
       });
     }
   }
@@ -219,7 +277,12 @@ std::pair<Matrix, Vector> eigen_decompose_small(const Matrix &B) {
     double off_diag_sum = parlay::reduce(parlay::tabulate(n * n, [&](size_t idx) {
         size_t i = idx / n;
         size_t j = idx % n;
-        return (i != j) ? A[i][j] * A[i][j] : 0.0;
+        if (i != j) {
+            return A[i][j] * A[i][j];
+        } 
+        else {
+            return 0.0;
+        }
     }));
 
     if(std::sqrt(off_diag_sum) < 1e-10){
@@ -237,7 +300,6 @@ std::pair<Matrix, Vector> eigen_decompose_small(const Matrix &B) {
 std::pair<Matrix, Vector> randomized_block_power_iteration(const Matrix& A, int k, int q = 100, const Matrix& Omega = Matrix()) {
     size_t d = A.size();
 
-    // Use provided Omega if available, otherwise generate a new one
     Matrix omega = Omega.size() > 0 ? Omega : random_matrix_generator(d, k);
     Matrix Y = parlay_matrix_multiply(A, omega);
 
@@ -315,7 +377,7 @@ void comparison_test(const Matrix& U, const std::vector<uint8_t>& labels) {
 
     auto top_k = sort_eigenpairs(eigenpairs);
     auto proj_matrix = get_proj_matrix(top_k);
-    auto projected   = parlay_matrix_multiply(U, proj_matrix);
+    auto projected = parlay_matrix_multiply(U, proj_matrix);
 
     // end timing
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -357,7 +419,8 @@ int iterations_test(const Matrix& U, const std::vector<uint8_t>& labels) {
         auto t0 = std::chrono::high_resolution_clock::now();
 
         auto U_t = parlay_transpose(U);
-        auto UTU = parlay_matrix_multiply(U_t, U);
+        // auto UTU = parlay_matrix_multiply(U_t, U);
+        auto UTU = blas_matrix_multiply(U_t, U);
 
         // Use the same Omega for all iterations
         auto result = randomized_block_power_iteration(UTU, k, q, Omega);
