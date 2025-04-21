@@ -234,25 +234,26 @@ std::pair<Matrix, Vector> eigen_decompose_small(const Matrix &B) {
   return {V, eigenvalues};
 }
 
-std::pair<Matrix, Vector> randomized_block_power_iteration(const Matrix& A, int k, int q = 100){
-  size_t d = A.size();
+std::pair<Matrix, Vector> randomized_block_power_iteration(const Matrix& A, int k, int q = 100, const Matrix& Omega = Matrix()) {
+    size_t d = A.size();
 
-  Matrix Omega = random_matrix_generator(d, k);
-  Matrix Y = parlay_matrix_multiply(A, Omega);
+    // Use provided Omega if available, otherwise generate a new one
+    Matrix omega = Omega.size() > 0 ? Omega : random_matrix_generator(d, k);
+    Matrix Y = parlay_matrix_multiply(A, omega);
 
-  for (int i = 0; i < q; ++i) {
-    Y = parlay_matrix_multiply(A, Y);
-    Y = parlay_transpose(Y);
-    Y = gram_schmidt(Y);
-    Y = parlay_transpose(Y);
-  }
+    for (int i = 0; i < q; ++i) {
+        Y = parlay_matrix_multiply(A, Y);
+        Y = parlay_transpose(Y);
+        Y = gram_schmidt(Y);
+        Y = parlay_transpose(Y);
+    }
 
-  Matrix Q = parlay_transpose(Y);
-  Matrix B = parlay_matrix_multiply(parlay_transpose(Q), parlay_matrix_multiply(A, Q));
-  auto [V, eigenvalues] = eigen_decompose_small(B);
-  Matrix eigenvectors = parlay_matrix_multiply(Q, V);
+    Matrix Q = parlay_transpose(Y);
+    Matrix B = parlay_matrix_multiply(parlay_transpose(Q), parlay_matrix_multiply(A, Q));
+    auto [V, eigenvalues] = eigen_decompose_small(B);
+    Matrix eigenvectors = parlay_matrix_multiply(Q, V);
 
-  return {eigenvectors, eigenvalues};
+    return {eigenvectors, eigenvalues};
 }
 
 parlay::sequence<eigenpair> sort_eigenpairs(const parlay::sequence<eigenpair>& data) {
@@ -297,16 +298,9 @@ void mean_center(Matrix& data) {
     });
 }
 
-int main() {
-    std::string filename = "train-images-idx3-ubyte";
-    Matrix U = load_mnist_images_parlay(filename);
-    mean_center(U);
-
-    auto labels = load_mnist_labels("train-labels-idx1-ubyte");
-
+void comparison_test(const Matrix& U, const std::vector<uint8_t>& labels) {
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    // your PCA‐projection block:
     auto U_t = parlay_transpose(U);
     auto UTU = parlay_matrix_multiply(U_t, U);
 
@@ -319,7 +313,7 @@ int main() {
         return eigenpair{eigenvalues[i], eigenvectors[i]};
     });
 
-    auto top_k      = sort_eigenpairs(eigenpairs);
+    auto top_k = sort_eigenpairs(eigenpairs);
     auto proj_matrix = get_proj_matrix(top_k);
     auto projected   = parlay_matrix_multiply(U, proj_matrix);
 
@@ -348,7 +342,76 @@ int main() {
     }
     out.close();
     std::cout << "Wrote " << n << " rows (+" << k 
-              << " PCs + 1 label) to projected_with_labels.csv\n";
+              << " PCs + 1 label) to pca_cpp.csv\n";
+}
 
+int iterations_test(const Matrix& U, const std::vector<uint8_t>& labels) {
+    std::vector<int> iterations = {5, 10, 50, 100};
+    
+    // Generate the random matrix once and reuse it for all iterations
+    size_t d = U.size();
+    int k = 2;
+    Matrix Omega = random_matrix_generator(d, k);
+    
+    for (int q : iterations) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        auto U_t = parlay_transpose(U);
+        auto UTU = parlay_matrix_multiply(U_t, U);
+
+        // Use the same Omega for all iterations
+        auto result = randomized_block_power_iteration(UTU, k, q, Omega);
+        const Matrix& eigenvectors = result.first;
+        const Vector& eigenvalues = result.second;
+
+        parlay::sequence<eigenpair> eigenpairs = parlay::tabulate(k, [&](size_t i) {
+            return eigenpair{eigenvalues[i], eigenvectors[i]};
+        });
+
+        auto top_k = sort_eigenpairs(eigenpairs);
+        auto proj_matrix = get_proj_matrix(top_k);
+        auto projected   = parlay_matrix_multiply(U, proj_matrix);
+
+        // end timing
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        std::chrono::duration<double> elapsed = t1 - t0;
+        std::cout << "Projection with " << q << " iterations took " 
+                << elapsed.count() << " seconds\n";
+        
+        size_t n = projected.size();
+        std::cout << "Projected matrix size: " << n << " × " << projected[0].size() << std::endl;
+
+        std::string output_file = "pca_cpp_" + std::to_string(q) + "_iters.csv";
+        std::ofstream out(output_file);
+        out << std::fixed << std::setprecision(6);
+        for (size_t j = 0; j < k; ++j) {
+            out << "PC" << (j+1) << ',';
+        }
+        out << "label\n";
+
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = 0; j < k; ++j) {
+                out << projected[i][j] << ',';
+            }
+            out << int(labels[i]) << '\n';
+        }
+        out.close();
+        std::cout << "Wrote " << n << " rows (+" << k 
+                << " PCs + 1 label) to " << output_file << "\n";
+    }
+    
+    return 0;
+}
+
+int main() {
+    std::string filename = "train-images-idx3-ubyte";
+    Matrix U = load_mnist_images_parlay(filename);
+    mean_center(U);
+
+    auto labels = load_mnist_labels("train-labels-idx1-ubyte");
+    
+    iterations_test(U, labels);
+    
     return 0;
 }
