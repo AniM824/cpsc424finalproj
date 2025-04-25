@@ -76,8 +76,8 @@ def run_implementation_comparison():
 def run_iterations_comparison():
     """Run the comparison between different iteration counts."""
     # Files from iterations_test with different iteration counts
-    iter_files = [f'pca_cpp_{iters}_iters.csv' for iters in [5, 10, 50, 100]]
-    titles = [f'{iters} Iterations' for iters in [5, 10, 50, 100]]
+    iter_files = [f'pca_cpp_{iters}_iters.csv' for iters in [2, 5, 10, 50]]
+    titles = [f'{iters} Iterations' for iters in [2, 5, 10, 50]]
     plot_comparison(iter_files, titles, 'pca_iterations_comparison.png')
 
 if __name__ == "__main__":

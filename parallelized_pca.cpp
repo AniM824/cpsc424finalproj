@@ -13,67 +13,8 @@
 #include <Accelerate/Accelerate.h>
 
 
-
 using Vector = parlay::sequence<double>;
 using Matrix = parlay::sequence<Vector>;
-
-
-
-
-
-
-
-
-// #include <cblas.h>
-#include "parlay/sequence.h"
-
-using Vector = parlay::sequence<double>;
-using Matrix = parlay::sequence<Vector>;
-
-Matrix blas_matrix_multiply(const Matrix& A, const Matrix& B) {
-    size_t m = A.size();        // rows of A
-    size_t k = A[0].size();     // cols of A (and rows of B)
-    size_t n = B[0].size();     // cols of B
-
-    // === Flatten A and B into row-major arrays ===
-    std::vector<double> A_flat(m * k);
-    std::vector<double> B_flat(k * n);
-
-    for (size_t i = 0; i < m; ++i)
-        std::copy(A[i].begin(), A[i].end(), A_flat.begin() + i * k);
-
-    for (size_t i = 0; i < k; ++i)
-        std::copy(B[i].begin(), B[i].end(), B_flat.begin() + i * n);
-
-    // === Allocate space for output ===
-    std::vector<double> C_flat(m * n, 0.0);
-
-    // === Call BLAS ===
-    cblas_dgemm(
-        CblasRowMajor, CblasNoTrans, CblasNoTrans,
-        m, n, k,
-        1.0,
-        A_flat.data(), k,
-        B_flat.data(), n,
-        0.0,
-        C_flat.data(), n
-    );
-
-    // === Convert back to parlay Matrix ===
-    Matrix C = parlay::tabulate(m, [&](size_t i) {
-        return parlay::tabulate(n, [&](size_t j) {
-            return C_flat[i * n + j];
-        });
-    });
-
-    return C;
-}
-
-
-
-
-
-
 
 struct eigenpair {
     double eigenvalue;
@@ -144,25 +85,56 @@ Matrix parlay_transpose(const Matrix &A) {
     });
 }
 
-double parlay_dot_product(const Vector &a, const Vector &b) {
-    return parlay::reduce(parlay::tabulate(a.size(), [&](size_t i) {
-        return a[i] * b[i];
-    }));
+double blas_dot_product(const Vector &a, const Vector &b) {
+    if (a.size() != b.size()) {
+        throw std::invalid_argument("Vectors must have the same size");
+    }
+    
+    std::vector<double> a_flat(a.begin(), a.end());
+    std::vector<double> b_flat(b.begin(), b.end());
+    
+    return cblas_ddot(a.size(), a_flat.data(), 1, b_flat.data(), 1);
 }
 
-Matrix parlay_matrix_multiply(
-    const parlay::sequence<parlay::sequence<double>> &A,
-    const parlay::sequence<parlay::sequence<double>> &B)
-{
-    size_t m = A.size();
-    size_t k = A[0].size();
-    size_t n = B[0].size();
+Matrix blas_matrix_multiply(const Matrix& A, const Matrix& B) {
+    size_t m = A.size();   
+    size_t k = A[0].size();  
+    size_t n = B[0].size();  
 
-    auto B_T = parlay_transpose(B);
+    // Flattening matrices more efficiently
+    std::vector<double> A_flat(m * k);
+    std::vector<double> B_flat(k * n);
 
+    // Optimize A matrix flattening - direct assignment instead of std::copy
+    parlay::parallel_for(0, m, [&](size_t i) {
+        for (size_t j = 0; j < k; ++j) {
+            A_flat[i * k + j] = A[i][j];
+        }
+    });
+
+    // Fix B matrix flattening - was incorrectly accessing data
+    parlay::parallel_for(0, k, [&](size_t i) {
+        for (size_t j = 0; j < n; ++j) {
+            B_flat[i * n + j] = B[i][j];
+        }
+    });
+
+    std::vector<double> C_flat(m * n, 0.0);
+
+    cblas_dgemm(
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        m, n, k,
+        1.0,
+        A_flat.data(), k,
+        B_flat.data(), n,
+        0.0,
+        C_flat.data(), n
+    );
+
+    // More efficient result conversion with better parallelism
     return parlay::tabulate(m, [&](size_t i) {
         return parlay::tabulate(n, [&](size_t j) {
-            return parlay_dot_product(A[i], B_T[j]);
+            return C_flat[i * n + j];
         });
     });
 }
@@ -197,7 +169,7 @@ Matrix gram_schmidt(const Matrix &Y_cols) {
 
         if (i > 0) {
             auto projections = parlay::tabulate(i, [&](size_t j) {
-                double dot = parlay_dot_product(qi, Q[j]);
+                double dot = blas_dot_product(qi, Q[j]);
                 return parlay::tabulate(d, [&](size_t l) {
                     return dot * Q[j][l];
                 });
@@ -271,8 +243,8 @@ std::pair<Matrix, Vector> eigen_decompose_small(const Matrix &B) {
 
   for (size_t iter = 0; iter < max_iters; ++iter) {
     auto [Q, R] = qr_decomposition_givens(A);
-    A = parlay_matrix_multiply(R, Q);
-    V = parlay_matrix_multiply(V, Q);
+    A = blas_matrix_multiply(R, Q);
+    V = blas_matrix_multiply(V, Q);
 
     double off_diag_sum = parlay::reduce(parlay::tabulate(n * n, [&](size_t idx) {
         size_t i = idx / n;
@@ -297,23 +269,33 @@ std::pair<Matrix, Vector> eigen_decompose_small(const Matrix &B) {
   return {V, eigenvalues};
 }
 
+Matrix extract_columns(const Matrix &A, size_t num_cols) {
+    size_t rows = A.size();
+    return parlay::tabulate(rows, [&](size_t i) {
+        return parlay::tabulate(num_cols, [&](size_t j) {
+            return A[i][j];
+        });
+    });
+}
+
 std::pair<Matrix, Vector> randomized_block_power_iteration(const Matrix& A, int k, int q = 100, const Matrix& Omega = Matrix()) {
     size_t d = A.size();
 
     Matrix omega = Omega.size() > 0 ? Omega : random_matrix_generator(d, k);
-    Matrix Y = parlay_matrix_multiply(A, omega);
+    Matrix Y = blas_matrix_multiply(A, omega);
 
     for (int i = 0; i < q; ++i) {
-        Y = parlay_matrix_multiply(A, Y);
+        Y = blas_matrix_multiply(A, Y);
         Y = parlay_transpose(Y);
         Y = gram_schmidt(Y);
         Y = parlay_transpose(Y);
     }
 
     Matrix Q = parlay_transpose(Y);
-    Matrix B = parlay_matrix_multiply(parlay_transpose(Q), parlay_matrix_multiply(A, Q));
+    Matrix A_trunc = extract_columns(A, k);
+    Matrix B = blas_matrix_multiply(parlay_transpose(Q), blas_matrix_multiply(A_trunc, Q));
     auto [V, eigenvalues] = eigen_decompose_small(B);
-    Matrix eigenvectors = parlay_matrix_multiply(Q, V);
+    Matrix eigenvectors = blas_matrix_multiply(Q, V);
 
     return {eigenvectors, eigenvalues};
 }
@@ -360,13 +342,12 @@ void mean_center(Matrix& data) {
     });
 }
 
-void comparison_test(const Matrix& U, const std::vector<uint8_t>& labels) {
+void comparison_test(const Matrix& U, const std::vector<uint8_t>& labels, int k) {
     auto t0 = std::chrono::high_resolution_clock::now();
 
     auto U_t = parlay_transpose(U);
-    auto UTU = parlay_matrix_multiply(U_t, U);
+    auto UTU = blas_matrix_multiply(U_t, U);
 
-    int k = 2;
     auto result = randomized_block_power_iteration(UTU, k);
     const Matrix& eigenvectors = result.first;
     const Vector& eigenvalues = result.second;
@@ -377,7 +358,7 @@ void comparison_test(const Matrix& U, const std::vector<uint8_t>& labels) {
 
     auto top_k = sort_eigenpairs(eigenpairs);
     auto proj_matrix = get_proj_matrix(top_k);
-    auto projected = parlay_matrix_multiply(U, proj_matrix);
+    auto projected = blas_matrix_multiply(U, proj_matrix);
 
     // end timing
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -407,19 +388,103 @@ void comparison_test(const Matrix& U, const std::vector<uint8_t>& labels) {
               << " PCs + 1 label) to pca_cpp.csv\n";
 }
 
-int iterations_test(const Matrix& U, const std::vector<uint8_t>& labels) {
-    std::vector<int> iterations = {5, 10, 50, 100};
+void detailed_time_test(const Matrix& U, const std::vector<uint8_t>& labels, int k, int num_iterations) {
+    auto start_total = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed;
+
+    std::cout << "" << std::endl;
+    
+    // Step 1: Transpose
+    auto t1_start = std::chrono::high_resolution_clock::now();
+    auto U_t = parlay_transpose(U);
+    auto t1_end = std::chrono::high_resolution_clock::now();
+    elapsed = t1_end - t1_start;
+    std::cout << "Transpose operation took " << elapsed.count() << " seconds\n";
+    
+    // Step 2: Matrix multiplication
+    auto t2_start = std::chrono::high_resolution_clock::now();
+    auto UTU = blas_matrix_multiply(U_t, U);
+    auto t2_end = std::chrono::high_resolution_clock::now();
+    elapsed = t2_end - t2_start;
+    std::cout << "Matrix multiplication took " << elapsed.count() << " seconds\n";
+    
+    // Step 3: Power iteration
+    auto t3_start = std::chrono::high_resolution_clock::now();
+    auto result = randomized_block_power_iteration(UTU, k, num_iterations);
+    auto t3_end = std::chrono::high_resolution_clock::now();
+    elapsed = t3_end - t3_start;
+    std::cout << "Randomized block power iteration with " << num_iterations << " iterations took " << elapsed.count() << " seconds\n";
+    
+    const Matrix& eigenvectors = result.first;
+    const Vector& eigenvalues = result.second;
+
+    // Step 4: Creating eigenpairs
+    auto t4_start = std::chrono::high_resolution_clock::now();
+    parlay::sequence<eigenpair> eigenpairs = parlay::tabulate(k, [&](size_t i) {
+        return eigenpair{eigenvalues[i], eigenvectors[i]};
+    });
+    auto t4_end = std::chrono::high_resolution_clock::now();
+    elapsed = t4_end - t4_start;
+    std::cout << "Creating eigenpairs took " << elapsed.count() << " seconds\n";
+    
+    // Step 5: Sorting eigenpairs
+    auto t5_start = std::chrono::high_resolution_clock::now();
+    auto top_k = sort_eigenpairs(eigenpairs);
+    auto t5_end = std::chrono::high_resolution_clock::now();
+    elapsed = t5_end - t5_start;
+    std::cout << "Sorting eigenpairs took " << elapsed.count() << " seconds\n";
+    
+    // Step 6: Getting projection matrix
+    auto t6_start = std::chrono::high_resolution_clock::now();
+    auto proj_matrix = get_proj_matrix(top_k);
+    auto t6_end = std::chrono::high_resolution_clock::now();
+    elapsed = t6_end - t6_start;
+    std::cout << "Getting projection matrix took " << elapsed.count() << " seconds\n";
+    
+    // Step 7: Final projection
+    auto t7_start = std::chrono::high_resolution_clock::now();
+    auto projected = blas_matrix_multiply(U, proj_matrix);
+    auto t7_end = std::chrono::high_resolution_clock::now();
+    elapsed = t7_end - t7_start;
+    std::cout << "Final projection took " << elapsed.count() << " seconds\n";
+    
+    auto end_total = std::chrono::high_resolution_clock::now();
+    elapsed = end_total - start_total;
+    std::cout << "Total PCA computation time: " << elapsed.count() << " seconds\n";
+
+    // Output results to CSV
+    size_t n = projected.size();
+    std::ofstream out("pca_cpp.csv");
+    out << std::fixed << std::setprecision(6);
+    for (size_t j = 0; j < k; ++j) {
+      out << "PC" << (j+1) << ',';
+    }
+    out << "label\n";
+
+    for (size_t i = 0; i < n; ++i) {
+      for (size_t j = 0; j < k; ++j) {
+        out << projected[i][j] << ',';
+      }
+      out << int(labels[i]) << '\n';
+    }
+    out.close();
+    std::cout << "Wrote " << n << " rows (+" << k 
+              << " PCs + 1 label) to pca_cpp.csv\n";
+
+    std::cout << "" << std::endl;
+}
+
+void iterations_test(const Matrix& U, const std::vector<uint8_t>& labels, int k) {
+    std::vector<int> iterations = {2, 5, 10, 50};
     
     // Generate the random matrix once and reuse it for all iterations
     size_t d = U.size();
-    int k = 2;
     Matrix Omega = random_matrix_generator(d, k);
     
     for (int q : iterations) {
         auto t0 = std::chrono::high_resolution_clock::now();
 
         auto U_t = parlay_transpose(U);
-        // auto UTU = parlay_matrix_multiply(U_t, U);
         auto UTU = blas_matrix_multiply(U_t, U);
 
         // Use the same Omega for all iterations
@@ -433,7 +498,7 @@ int iterations_test(const Matrix& U, const std::vector<uint8_t>& labels) {
 
         auto top_k = sort_eigenpairs(eigenpairs);
         auto proj_matrix = get_proj_matrix(top_k);
-        auto projected   = parlay_matrix_multiply(U, proj_matrix);
+        auto projected   = blas_matrix_multiply(U, proj_matrix);
 
         // end timing
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -460,11 +525,7 @@ int iterations_test(const Matrix& U, const std::vector<uint8_t>& labels) {
             out << int(labels[i]) << '\n';
         }
         out.close();
-        std::cout << "Wrote " << n << " rows (+" << k 
-                << " PCs + 1 label) to " << output_file << "\n";
     }
-    
-    return 0;
 }
 
 int main() {
@@ -474,7 +535,12 @@ int main() {
 
     auto labels = load_mnist_labels("train-labels-idx1-ubyte");
     
-    iterations_test(U, labels);
+    // Define k here and pass to the functions
+    int k = 2;
+    
+    detailed_time_test(U, labels, k, 50);
+    // comparison_test(U, labels, k);
+    // iterations_test(U, labels, k);
     
     return 0;
 }
